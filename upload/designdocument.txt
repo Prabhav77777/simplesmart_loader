@@ -1,0 +1,109 @@
+OPERATING SYSTEMS ASSIGNMENT 4 - SIMPLESMARTLOADER
+
+GROUP ID:65
+
+GROUP MEMBERS
+Prabhav Agrawal (2025377)
+Rudrakshi Agarwal (2025439)
+
+1. OVERVIEW
+
+SimpleSmartLoader is a lazy (demand paging) version of the Assignment-1
+SimpleLoader for 32-bit, non-PIE ELF executables that do not use glibc.
+It is built as a shared library (bin/lib_simpleloader.so) that is linked with
+the launcher (bin/launch). No segment is mapped or copied up front. Memory is
+mapped one 4 KB page at a time, only when the program touches it.
+
+2. IMPLEMENTATION (loader/loader.c)
+
+r_header()
+  Opens the executable, checks it is a regular file, reads the ELF header and
+  the program header table (only these, not the segments) and validates them:
+  ELF magic, 32-bit class, little endian, ELF identification version, ELF version, header size, EM_386,
+  ET_EXEC, program header table inside the file. The file descriptor is kept open for later pread() calls.
+
+check_seg()
+  Checks each PT_LOAD segment (filesz <= memsz, no address overflow, data
+  inside the file), checks that e_entry is in an executable segment, and
+  allocates an array that remembers which pages get mapped (needed because
+  the handler must not call malloc). Nothing is mmap'ed here.
+
+load_and_run_elf()
+  Installs the SIGSEGV handler (SA_SIGINFO | SA_ONSTACK) on a separate
+  signal stack (sigaltstack), so the handler still runs if the program's own
+  stack pointer is corrupted. Then it calls e_entry through a function pointer.
+  This faults at once because no page exists yet. When _start returns, the
+  old handler is restored and the return value and statistics are printed.
+
+on_segv()  (the page fault handler)
+  1. If the page containing the faulting address overlaps no PT_LOAD segment
+     (NULL, wild pointer) it is a real error: report it and stop.
+  2. If the page is already mapped but the access is not allowed
+     (si_code == SEGV_ACCERR, e.g. writing to .text) it is also a real error.
+  3. Otherwise it is a page fault: mmap exactly one page at the page aligned
+     address (MAP_FIXED_NOREPLACE, so we never overwrite the loader's own
+     memory), copy the file backed bytes of that page with pread(), leave the
+     rest zero (this is how .bss works), then mprotect() the page with the
+     permissions from p_flags (R/W/X). Returning from the handler re-executes
+     the faulting instruction, so the program just continues.
+  A 5 KB segment therefore takes two page faults, one per page. If two
+  segments share a page, both are filled into that page and their permissions
+  are OR-ed.
+  On a real error the handler uses siglongjmp to return to
+  load_and_run_elf(), which prints the error and the statistics so far and
+  exits with status 1.
+
+fill_page()      copies the file bytes of one page and computes its protection.
+loader_cleanup() restores the old handler, unmaps every page the loader
+                 mapped, frees memory and closes the file.
+
+launcher/launch.c checks the argument count, calls load_and_run_elf() and then
+loader_cleanup(). loader/loader.h is unchanged from Assignment 1.
+
+3. STATISTICS
+
+Page faults:         valid faults on pages that were not mapped yet.
+Page allocations:    successful 4 KB mmap calls (equal to page faults here,
+                     because every page is mapped exactly once).
+Internal fragmentation: for every mapped page, 4096 minus the number of bytes
+                     of that page that belong to a PT_LOAD segment (its memsz
+                     range), summed over all mapped pages and printed in KB.
+
+Example (test/sum):
+  User _start return value = 2048
+  Total Page Faults: 3
+  Total Page Allocations: 3
+  Total Internal Fragmentation: 7.89 KB
+
+4. ERROR HANDLING
+
+Wrong argument count; file that cannot be opened or read; not a regular file;
+empty, short or non-ELF file; 64-bit, big endian, non-x86 or PIE (ET_DYN)
+file; bad ELF version or header size; bad program header table; corrupt or overlapping PT_LOAD segments; entry point outside an
+executable segment; malloc/calloc, sigaction and sigaltstack failures. At run time:
+access outside every segment, permission violations on mapped pages, and
+mmap, mprotect and pread failures. All of these print a message and exit
+with status 1.
+
+5. BUILD AND RUN
+
+  make               builds bin/lib_simpleloader.so, bin/launch, test/fib, test/sum
+  ./bin/launch test/fib
+  ./bin/launch test/sum
+  make check         runs extra tests in test/extra (optional, for our own testing)
+  make clean
+
+A 32-bit toolchain is needed (gcc-multilib on 64-bit Linux).
+Tests: test/fib.c and test/sum.c (supplied, unchanged).
+
+6. CONTRIBUTION:
+
+Prabhav Agrawal (2025377): 
+
+Rudrakshi Agarwal (2025439): 
+
+7. GITHUB REPOSITORY
+
+Private repository: https://github.com/Prabhav77777/simplesmart_loader.git
+
+8. AI USAGE DISCLOSURE:
