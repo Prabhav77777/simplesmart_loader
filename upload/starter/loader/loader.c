@@ -126,3 +126,175 @@ static void unhook()
   }
   hooked = 0;
 }
+void loader_cleanup()
+{
+  unhook();
+  for (size_t i = 0; i < nmapped; i++){
+    munmap((void *)mapped[i], PG);
+  }
+  free(mapped);
+  free(ph);
+  mapped = NULL;
+  ph = NULL;
+  nmapped = maxpages = 0;
+  if (fd >= 0){
+    close(fd);
+  }
+  fd = -1;
+}
+
+static void die(const char *msg)
+{
+  if (msg){
+    fprintf(stderr, "SimpleSmartLoader: %s\n", msg);
+  }
+  else{
+    perror("SimpleSmartLoader: open");
+  }
+  loader_cleanup();
+  exit(1);
+}
+
+static void r_header(const char *path)
+{
+  struct stat st;
+  if ((fd = open(path, O_RDONLY)) < 0){
+    die(NULL);
+  }
+  if (fstat(fd, &st) < 0){
+    die("fstat failed");
+  }
+  if (!S_ISREG(st.st_mode)){
+    die("not a regular file");
+  }
+  fsize = st.st_size;
+  ssize_t n = pread(fd, &eh, sizeof eh, 0);
+  if (n < 0){
+    die("cannot read file");
+  }
+  if (n < SELFMAG || memcmp(eh.e_ident, ELFMAG, SELFMAG)){
+    die("not an ELF file");
+  }
+  if ((size_t)n < sizeof eh){
+    die("ELF header too short");
+  }
+  if (eh.e_ident[EI_CLASS] != ELFCLASS32){
+    die("not a 32-bit ELF file");
+  }
+  if (eh.e_ident[EI_DATA] != ELFDATA2LSB){
+    die("not a little-endian ELF file");
+  }
+  if (eh.e_ident[EI_VERSION] != EV_CURRENT){
+    die("bad ELF identification version");
+  }
+  if (eh.e_version != EV_CURRENT || eh.e_ehsize != sizeof eh){
+    die("bad ELF header");
+  }
+  if (eh.e_machine != EM_386){
+    die("not an x86 ELF file");
+  }
+  if (eh.e_type != ET_EXEC){
+    die("not an ET_EXEC executable (PIE is not supported)");
+  }
+  if (!eh.e_phnum || eh.e_phentsize != sizeof(Elf32_Phdr)){
+    die("bad program header table");
+  }
+  size_t phsz = (size_t)eh.e_phnum * sizeof(Elf32_Phdr);
+  if ((uint64_t)eh.e_phoff + phsz > (uint64_t)fsize){
+    die("program headers out of bounds");
+  }
+  if (!(ph = malloc(phsz))){
+    die("out of memory");
+  }
+  if (read_full(eh.e_phoff, ph, phsz) < 0){
+    die("cannot read program headers");
+  }
+}
+
+static void check_seg()
+{
+  size_t pages = 0;
+  int entry_ok = 0;
+  for (int i = 0; i < eh.e_phnum; i++)
+  {
+    Elf32_Phdr *p = &ph[i];
+    if (!is_load(p)){
+      continue;
+    }
+    if (p->p_filesz > p->p_memsz){
+      die("bad segment: filesz > memsz");
+    }
+    if (p->p_align > 1 && (p->p_align & (p->p_align - 1)) != 0){
+      die("invalid segment alignment");
+    }
+    if ((uint64_t)p->p_vaddr + p->p_memsz > 0xFFFFFFFFull){
+      die("bad segment: address overflow");
+    }
+    if ((uint64_t)p->p_offset + p->p_filesz > (uint64_t)fsize){
+      die("bad segment: beyond end of file");
+    }
+    for (int j = 0; j < i; j++){
+      if (is_load(&ph[j]) && p->p_vaddr < (uint64_t)ph[j].p_vaddr + ph[j].p_memsz && ph[j].p_vaddr < (uint64_t)p->p_vaddr + p->p_memsz){
+        die("bad ELF: overlapping segments");
+      }
+    }
+    pages += ((p->p_vaddr + p->p_memsz - 1) >> 12) - (p->p_vaddr >> 12) + 1;
+    if ((p->p_flags & PF_X) && eh.e_entry >= p->p_vaddr && eh.e_entry < (uint64_t)p->p_vaddr + p->p_memsz){
+      entry_ok = 1;
+    }
+  }
+  if (!pages){
+    die("no loadable segments");
+  }
+  if (!entry_ok){
+    die("entrypoint not in an executable segment");
+  }
+  if (!(mapped = calloc(pages, sizeof *mapped))){
+    die("out of memory");
+  }
+  maxpages = pages;
+}
+
+static void print_stats()
+{
+  printf("Total Page Faults: %lu\nTotal Page Allocations: %lu\nTotal Internal Fragmentation: %.2f KB\n", faults, allocs, frag / 1024.0);
+}
+
+void load_and_run_elf(char **exe)
+{
+  if (!exe || !exe[0]){
+    die("no executable given");
+  }
+  faults = allocs = frag = 0;
+  r_header(exe[0]);
+  check_seg();
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = on_segv;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  sigemptyset(&sa.sa_mask);
+  stack_t ss = {.ss_sp = altstk, .ss_size = sizeof altstk, .ss_flags = 0};
+  if (sigaction(SIGSEGV, &sa, &old_sa) < 0){
+    die("sigaction failed");
+  }
+  if (sigaltstack(&ss, &old_ss) < 0)
+  {
+    sigaction(SIGSEGV, &old_sa, NULL);
+    die("sigaltstack failed");
+  }
+  hooked = 1;
+  if (sigsetjmp(jb, 1) == 0)
+  {
+    int (*start)(void) = (int (*)(void))(uintptr_t)eh.e_entry;
+    int res = start();
+    unhook();
+    printf("User _start return value = %d\n", res);
+    print_stats();
+    return;
+  }
+  unhook();
+  fprintf(stderr, "SimpleSmartLoader: %s at 0x%08lx\n", fmsg, (unsigned long)faddr);
+  print_stats();
+  loader_cleanup();
+  exit(1);
+}
